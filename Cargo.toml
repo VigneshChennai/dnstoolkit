@@ -8,7 +8,11 @@ edition = "2018"
 
 [dependencies]
 smallvec = "1.5.1"
-idna = "0.2.0"
 thiserror = "1.0.22"
-itertools = "*"
 lazy_static = "1.4.0"
+
+[dependencies.idna]
+git = "https://github.com/servo/rust-url.git"
+branch = 'master'
+path = "/idna"
+tag = "v2.2.0"

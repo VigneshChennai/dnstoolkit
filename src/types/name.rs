@@ -1,5 +1,3 @@
-
-
 use std::convert::TryFrom;
 use std::fmt::Display;
 use std::str::FromStr;
@@ -9,6 +7,9 @@ use smallvec::alloc::fmt::Formatter;
 use smallvec::SmallVec;
 use thiserror::Error;
 use std::ops::Deref;
+use idna::Config;
+use std::any::Any;
+
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Label<'a> {
@@ -17,19 +18,33 @@ pub struct Label<'a> {
 
 impl<'a> Display for Label<'a> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let v = idna::domain_to_unicode(
-            unsafe {
-                // self.value is never set to non ASCII value.
-                // So, the below step is safe.
-                String::from_utf8_unchecked(Vec::from(self.value)).as_str()
-            }).0;
-        write!(f, "Label({})", v)
+        write!(f, "{}", unsafe {std::str::from_utf8_unchecked(self.value)})
     }
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Name {
-    value: SmallVec::<[u8; 36]>
+    value: SmallVec<[u8; 36]>
+}
+
+/// The errors that can happen when parsing
+///
+/// 1. &str to Name
+/// 2. &[u8] to Name
+///
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum NameParseError {
+    #[error("IDNAError")]
+    IDNAError(#[from] idna::Errors),
+    #[error("Utf8Error: {0}")]
+    Utf8Error(#[from] FromUtf8Error),
+    #[error("Name '{0}' is larger than 255 characters")]
+    NameTooLarge(String),
+    #[error("Label '{0}' is larger than 63 characters")]
+    LabelTooLong(String),
+    #[error("EmptyLabel at position '{0}'")]
+    EmptyLabel(usize)
 }
 
 impl Name {
@@ -42,7 +57,7 @@ impl Name {
         self.value.len() > 0 && self.value[self.len() - 1] == '.' as u8
     }
 
-    /// This function is unsafe because, there is no checks made to ensure the given
+    /// This function is unsafe because there is no checks made to ensure the given
     /// &[u8] is ascii u8 slice
     ///
     /// This the responsibility of the caller to ensure the &[u8] is a u8 slice of ascii
@@ -81,12 +96,14 @@ impl Name {
     ///
     /// All the above responsibility is the responsibility of the caller to ensure
     /// not undefined behaviour occurs.
+    #[inline]
     pub unsafe fn from_bytes_raw(name: &[u8]) -> Result<Self, NameParseError> {
         Ok(Name {
             value: SmallVec::<[u8; 36]>::from(name)
         })
     }
 
+    #[inline]
     pub fn from_bytes(name: &[u8]) -> Result<Self, NameParseError> {
         let string = String::from_utf8(Vec::from(name))?;
         string.parse()
@@ -97,35 +114,60 @@ impl Name {
     ///
     /// This the responsibility of the caller to ensure the &str is a ascii text
     /// to prevent any undefined behaviour
+    #[inline]
     pub unsafe fn from_text_ascii(name: &str) -> Result<Self, NameParseError> {
-
-        if let Err(e) = Self::from_bytes_ascii(name.as_bytes()) {
-            return Err(e)
-        }
-
-        Self::from_bytes_raw(name.as_bytes())
+        Self::from_bytes_ascii(name.as_bytes())
     }
 
+    #[inline]
     pub fn from_text(name: &str) -> Result<Self, NameParseError> {
-        let idna_domain = match idna::domain_to_ascii(name) {
-            Ok(value) => value,
-            Err(errors) => return Err(NameParseError::IDNAError(errors))
-        };
+        let idna = idna::Config::default();
+        // Disabling hyphen '-' check on label
+        // If set to true, labels starts with and ends with hyphens are marked as errors
+        idna.check_hyphens(false);
+
+        // Disabling transitional processing.
+        //
+        // What it mean is that, the codepoints/characters which are valid in idna2003
+        // but has a different codepoint/character in idna2008 be
+        // will changed/replaced as per idna2008
+        // mapping.
+        //
+        // if set to true, those codepoints/characters won't be modified.
+        idna.transitional_processing(false);
+
+        // Disabled std3 specific rules
+        //
+        // This means that the codepoints/characters which are invalid in idna2003 but are valid or
+        // mapped to other codepoint/characters in idna2008 will be unmodified or
+        // changed/replaced as per idna2008 mapping.
+        //
+        // if set to true, labels contain those codepoints/characters will be marked as errors.
+        idna.use_std3_ascii_rules(false);
+
+        // Disabled Label max length and Domain name max length and other similar check.
+        //
+        // Disabled at idna level as we are performing these checks in this crates code
+        idna.verify_dns_length(false);
+
+        // Converting unicode string to idna compatible format.
+        // Any error occurred will be propagated.
+        let idna_domain = idna::domain_to_ascii(name)?;
 
         // This is safe because, idna::domain_to_ascii function will return
         // String only with ascii characters
         return unsafe { Self::from_text_ascii(idna_domain.as_str()) }
     }
 
+    // TODO: implement ```fn from_wire(&self, ...)```
     // TODO: implement ```fn is_wild(&self)```
     // TODO: implement ```fn fullcompare(&self, other: Self)```
     // TODO: implement ```fn is_subdomain(&self)```
     // TODO: implement ```fn is_superdomain(&self)```
-    // TODO: implement ```fn canonicalize(&self)```
     // TODO: implement ```fn to_text(&self)```
     // TODO: implement ```fn to_unicode(&self)```
-    // TODO: implement ```fn to_digestable(&self, origin: Self)```
     // TODO: implement ```fn to_wire(&self, ...)```
+    // TODO: implement ```fn to_digestable(&self, origin: Self)```
     // TODO: implement ```fn split(&self, depth: usize)```
     // TODO: implement ```fn concatenate(&self, other: Self)```
     // TODO: implement ```fn relativize(&self, origin: Self)```
@@ -136,44 +178,8 @@ impl Name {
 
 impl Display for Name {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let v = idna::domain_to_unicode(
-            unsafe {
-                // self.value is never set to non ASCII value.
-                // So, the below step is safe.
-                String::from_utf8_unchecked(Vec::from(self.value.as_slice())).as_str()
-            }
-        ).0;
-        write!(f, "{}", v)
+        write!(f, "{}", unsafe {std::str::from_utf8_unchecked(self.value.as_ref())})
     }
-}
-
-impl Deref for Name {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        self.value.as_ref()
-    }
-}
-
-impl AsRef<[u8]> for Name {
-    fn as_ref(&self) -> &[u8] {
-        self
-    }
-}
-
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum NameParseError {
-    #[error("IDNAError: {0:?}")]
-    IDNAError(idna::Errors),
-    #[error("Utf8Error: {0}")]
-    Utf8Error(#[from] FromUtf8Error),
-    #[error("Name '{0}' is larger than 255 characters")]
-    NameTooLarge(String),
-    #[error("Label '{0}' is larger than 63 characters")]
-    LabelTooLong(String),
-    #[error("EmptyLabel at position '{0}'")]
-    EmptyLabel(usize),
 }
 
 impl FromStr for Name {
@@ -207,6 +213,27 @@ impl TryFrom<String> for Name {
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
         value.parse()
+    }
+}
+
+impl Deref for Name {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.value.as_ref()
+    }
+}
+
+impl AsRef<[u8]> for Name {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl AsRef<str> for Name {
+    fn as_ref(&self) -> &str {
+        // This is safe as we never allow non ascii characters in self.value
+        unsafe {std::str::from_utf8_unchecked(self.value.as_ref())}
     }
 }
 
